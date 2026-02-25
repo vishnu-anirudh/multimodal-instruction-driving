@@ -41,7 +41,15 @@ def collate_batch(batch):
     future = torch.tensor([b.future for b in batch], dtype=torch.float32)
     texts = [b.instruction for b in batch]
     map_features = [b.map_features for b in batch]
-    return history, future, texts, map_features
+    hazard_scores = [b.hazard_score for b in batch]
+    return history, future, texts, map_features, hazard_scores
+
+
+def parse_allowed_types(value: str) -> tuple[str, ...] | None:
+    cleaned = value.strip()
+    if not cleaned or cleaned.lower() == "all":
+        return None
+    return tuple(part.strip() for part in cleaned.split(",") if part.strip())
 
 
 def main() -> None:
@@ -77,10 +85,24 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--min_instruction_words", type=int, default=5)
+    parser.add_argument("--allowed_instruction_types", type=str, default="")
+    parser.add_argument("--normalize", action="store_true")
+    parser.add_argument("--jitter_std", type=float, default=0.0)
+    parser.add_argument("--text_cache_path", type=str, default="")
+    parser.add_argument("--use_hazard", action="store_true")
     args = parser.parse_args()
 
     set_seed(args.seed)
-    dataset = TrajectoryDataset(args.dataset)
+    allowed_types = parse_allowed_types(args.allowed_instruction_types)
+    dataset = TrajectoryDataset(
+        args.dataset,
+        min_instruction_words=args.min_instruction_words,
+        allowed_instruction_types=allowed_types,
+        normalize=args.normalize,
+    )
+    if args.use_hazard and "hazard_score" not in dataset.frame.columns:
+        raise ValueError("use_hazard is set but dataset is missing hazard_score column")
     train_idx, val_idx = split_indices(len(dataset), args.val_ratio, args.seed)
     train_set = Subset(dataset, train_idx)
     val_set = Subset(dataset, val_idx)
@@ -92,10 +114,16 @@ def main() -> None:
     history_steps = sample.history.shape[0]
     future_steps = sample.future.shape[0]
 
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
     vectorizer = None
     st_model = None
+    text_cache = None
     text_encoder = args.text_encoder
 
     def build_text_encoder() -> "SentenceTransformer":
@@ -107,8 +135,13 @@ def main() -> None:
         except Exception:
             return SentenceTransformer(args.minilm_model, device="cpu")
 
+    hazard_dim = 1 if args.use_hazard else 0
     if args.model == "history_mlp":
-        model = HistoryMLP(history_steps=history_steps, future_steps=future_steps)
+        model = HistoryMLP(
+            history_steps=history_steps,
+            future_steps=future_steps,
+            hazard_dim=hazard_dim,
+        )
     else:
         if text_encoder == "tfidf":
             vectorizer = TfidfVectorizer(max_features=256)
@@ -118,18 +151,44 @@ def main() -> None:
         else:
             st_model = build_text_encoder()
             text_dim = st_model.get_sentence_embedding_dimension()
+            if args.text_cache_path:
+                cache_path = Path(args.text_cache_path)
+                if cache_path.exists():
+                    data = np.load(cache_path, allow_pickle=True)
+                    texts = data["texts"].tolist()
+                    embeddings = data["embeddings"]
+                    text_cache = {text: embeddings[i] for i, text in enumerate(texts)}
+                else:
+                    unique_texts = (
+                        dataset.frame["instruction"]
+                        .fillna("")
+                        .astype(str)
+                        .unique()
+                        .tolist()
+                    )
+                    embeddings = st_model.encode(
+                        unique_texts,
+                        batch_size=args.text_batch_size,
+                        convert_to_numpy=True,
+                        normalize_embeddings=False,
+                    ).astype(np.float32)
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.savez(cache_path, texts=np.array(unique_texts, dtype=object), embeddings=embeddings)
+                    text_cache = {text: embeddings[i] for i, text in enumerate(unique_texts)}
 
         if args.model == "history_text_fusion":
             model = HistoryTextFusion(
                 history_steps=history_steps,
                 future_steps=future_steps,
                 text_dim=text_dim,
+                hazard_dim=hazard_dim,
             )
         elif args.model == "history_gru_text_fusion":
             model = HistoryGRUTextFusion(
                 history_steps=history_steps,
                 future_steps=future_steps,
                 text_dim=text_dim,
+                hazard_dim=hazard_dim,
             )
         else:
             if sample.map_features is None:
@@ -141,6 +200,7 @@ def main() -> None:
                     future_steps=future_steps,
                     text_dim=text_dim,
                     map_dim=map_dim,
+                    hazard_dim=hazard_dim,
                 )
             else:
                 model = HistoryGRUTextMapFusion(
@@ -148,6 +208,7 @@ def main() -> None:
                     future_steps=future_steps,
                     text_dim=text_dim,
                     map_dim=map_dim,
+                    hazard_dim=hazard_dim,
                 )
 
     model = model.to(device)
@@ -158,30 +219,50 @@ def main() -> None:
         if text_encoder == "tfidf":
             feats = vectorizer.transform(texts).toarray().astype(np.float32)
         else:
-            feats = st_model.encode(
-                texts,
-                batch_size=args.text_batch_size,
-                convert_to_numpy=True,
-                normalize_embeddings=False,
-            ).astype(np.float32)
+            if text_cache is not None:
+                missing = [t for t in texts if t not in text_cache]
+                if missing:
+                    new_embs = st_model.encode(
+                        missing,
+                        batch_size=args.text_batch_size,
+                        convert_to_numpy=True,
+                        normalize_embeddings=False,
+                    ).astype(np.float32)
+                    for text, emb in zip(missing, new_embs, strict=False):
+                        text_cache[text] = emb
+                feats = np.stack([text_cache[t] for t in texts], axis=0).astype(np.float32)
+            else:
+                feats = st_model.encode(
+                    texts,
+                    batch_size=args.text_batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=False,
+                ).astype(np.float32)
         return torch.tensor(feats, dtype=torch.float32, device=device)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
-        for history, future, texts, map_features in train_loader:
+        for history, future, texts, map_features, hazard_scores in train_loader:
             history = history.to(device)
             future = future.to(device)
+            if args.jitter_std > 0:
+                history = history + torch.randn_like(history) * args.jitter_std
             optimizer.zero_grad()
+            hazard = None
+            if args.use_hazard:
+                if any(score is None for score in hazard_scores):
+                    raise ValueError("Hazard score missing for at least one sample")
+                hazard = torch.tensor(hazard_scores, dtype=torch.float32, device=device).unsqueeze(-1)
             if args.model == "history_mlp":
-                pred = model(history)
+                pred = model(history, hazard)
             else:
                 text_feats = encode_text(texts)
                 if args.model in {"history_text_fusion", "history_gru_text_fusion"}:
-                    pred = model(history, text_feats)
+                    pred = model(history, text_feats, hazard)
                 else:
                     map_feats = torch.tensor(map_features, dtype=torch.float32, device=device)
-                    pred = model(history, text_feats, map_feats)
+                    pred = model(history, text_feats, map_feats, hazard)
             loss = loss_fn(pred, future)
             loss.backward()
             optimizer.step()
@@ -192,18 +273,23 @@ def main() -> None:
         preds = []
         gts = []
         with torch.no_grad():
-            for history, future, texts, map_features in val_loader:
+            for history, future, texts, map_features, hazard_scores in val_loader:
                 history = history.to(device)
                 future = future.to(device)
+                hazard = None
+                if args.use_hazard:
+                    if any(score is None for score in hazard_scores):
+                        raise ValueError("Hazard score missing for at least one sample")
+                    hazard = torch.tensor(hazard_scores, dtype=torch.float32, device=device).unsqueeze(-1)
                 if args.model == "history_mlp":
-                    pred = model(history)
+                    pred = model(history, hazard)
                 else:
                     text_feats = encode_text(texts)
                     if args.model in {"history_text_fusion", "history_gru_text_fusion"}:
-                        pred = model(history, text_feats)
+                        pred = model(history, text_feats, hazard)
                     else:
                         map_feats = torch.tensor(map_features, dtype=torch.float32, device=device)
-                        pred = model(history, text_feats, map_feats)
+                        pred = model(history, text_feats, map_feats, hazard)
                 preds.append(pred.cpu().numpy())
                 gts.append(future.cpu().numpy())
         metrics = batch_metrics(np.concatenate(preds, axis=0), np.concatenate(gts, axis=0))
